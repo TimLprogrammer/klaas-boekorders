@@ -55,12 +55,22 @@ def format_name(row):
 def format_address(row):
     """Formatteer het adres."""
     street = str(row['street']).strip() if pd.notna(row['street']) and str(row['street']).strip() else ''
-    housenumber = str(row['housenumber']).strip() if pd.notna(row['housenumber']) and str(row['housenumber']).strip() else ''
-    suffix = str(row['housenumber_suffix']).strip() if pd.notna(row['housenumber_suffix']) and str(row['housenumber_suffix']).strip() else ''
+
+    # Converteer huisnummer naar string en verwijder decimalen
+    housenumber_raw = row['housenumber']
+    if pd.notna(housenumber_raw):
+        if isinstance(housenumber_raw, (int, float)):
+            housenumber = str(int(housenumber_raw)) if housenumber_raw == int(housenumber_raw) else str(housenumber_raw).rstrip('.0')
+        else:
+            housenumber = str(housenumber_raw).strip()
+    else:
+        housenumber = ''
+
+    suffix = str(row['housenumber_suffix']).strip() if pd.notna(row['housenumber_suffix']) and str(row['housenumber_suffix']).strip() and str(row['housenumber_suffix']).strip() != 'nan' else ''
 
     # Combineer huisnummer met toevoeging
     full_housenumber = housenumber
-    if suffix and suffix != 'nan':
+    if suffix:
         full_housenumber += suffix
 
     # Combineer straat en huisnummer
