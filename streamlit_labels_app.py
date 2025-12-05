@@ -16,10 +16,82 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageTemplat
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 from PyPDF2 import PdfMerger
+from io import BytesIO
 
 # ------------------------------
 # FUNCTIES UIT ORIGINELE SCRIPT
 # ------------------------------
+
+def generate_excel_export(df_filtered):
+    """Genereer Excel bestand met de juiste kolommen voor verzending."""
+    # Maak een kopie om origineel niet te wijzigen
+    df_copy = df_filtered.copy()
+
+    # Herhaal elke rij op basis van quantity (quantity=3 → 3 rijen)
+    def parse_quantity(x):
+        if pd.isna(x):
+            return 1
+        try:
+            val = int(float(x))
+            return max(1, val)  # Minimaal 1
+        except (ValueError, TypeError):
+            return 1
+
+    repeat_counts = df_copy['quantity'].apply(parse_quantity)
+    df_expanded = df_copy.loc[df_copy.index.repeat(repeat_counts)].reset_index(drop=True)
+
+    # Maak een nieuwe DataFrame met de gewenste kolommen
+    excel_data = pd.DataFrame()
+
+    # Map de kolommen van CSV naar Excel formaat
+    excel_data['Bedrijfsnaam'] = df_expanded['company'].fillna('')
+    excel_data['Bedrijfsnaam2'] = ''  # Niet beschikbaar in CSV
+    excel_data['Afdeling'] = ''  # Niet beschikbaar in CSV
+    excel_data['Geslacht'] = ''  # Niet beschikbaar in CSV
+
+    # Voorletters afleiden van firstname (eerste letter + punt)
+    excel_data['Voorletters'] = df_expanded['firstname'].apply(
+        lambda x: f"{str(x)[0].upper()}." if pd.notna(x) and str(x).strip() else ''
+    )
+
+    excel_data['Achternaam'] = df_expanded['lastname'].fillna('')
+    excel_data['Postadres'] = df_expanded['street'].fillna('')
+
+    # Huisnummer zonder decimalen
+    excel_data['Huisnummer'] = df_expanded['housenumber'].apply(
+        lambda x: str(int(x)) if pd.notna(x) and isinstance(x, (int, float)) else str(x) if pd.notna(x) else ''
+    )
+
+    excel_data['Huisnummertoevoeging'] = df_expanded['housenumber_suffix'].apply(
+        lambda x: str(x) if pd.notna(x) and str(x) != 'nan' else ''
+    )
+
+    excel_data['Postcode'] = df_expanded['zipcode'].fillna('')
+    excel_data['Plaats'] = df_expanded['city'].fillna('')
+    excel_data['Landcode'] = df_expanded['country_code'].fillna('')
+    excel_data['Emailadres'] = df_expanded['email'].fillna('')
+
+    # Schrijf naar Excel in memory
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        excel_data.to_excel(writer, index=False, sheet_name='Verzendadressen')
+
+        # Auto-fit kolom breedtes
+        worksheet = writer.sheets['Verzendadressen']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+            # Voeg wat extra ruimte toe
+            adjusted_width = max_length + 2
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
+    return output.getvalue()
 
 def read_csv_data(file):
     """Lees het CSV-bestand en retourneer de data als pandas DataFrame."""
@@ -356,7 +428,7 @@ def create_pdf_from_labels(labels, output_file):
 # ------------------------------
 
 
-def show_overview_and_buttons(df, selected_products, sort_order, start_date, end_date, min_quantity, max_quantity):
+def show_overview_and_buttons(df, selected_products, sort_order, start_date, end_date, min_quantity, max_quantity, selected_names, product_logic):
     """Toon het overzicht met beide knoppen op dezelfde pagina."""
 
     # Maak een kopie van de dataframe voor filtering
@@ -364,6 +436,9 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
 
     # Converteer betaaldatum naar datetime
     df_filtered['paid_at'] = pd.to_datetime(df_filtered['paid_at'], errors='coerce')
+
+    # Voeg full_name toe voor naam filtering
+    df_filtered['full_name'] = df_filtered.apply(lambda row: f"{str(row.get('firstname', '')).strip()} {str(row.get('lastname', '')).strip()}".strip(), axis=1)
 
     # Pas filters toe
     # Datum filter
@@ -373,9 +448,30 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
             (df_filtered['paid_at'].dt.date <= end_date)
         ]
 
-    # Product filter
+    # Naam filter
+    if selected_names:
+        df_filtered = df_filtered[df_filtered['full_name'].isin(selected_names)]
+
+    # Product filter met AND/OR logica
     if selected_products:
-        df_filtered = df_filtered[df_filtered['product'].isin(selected_products)]
+        if product_logic == "OR":
+            # OR logica: minstens één geselecteerd product
+            df_filtered = df_filtered[df_filtered['product'].isin(selected_products)]
+        else:
+            # AND logica: alle geselecteerde producten moeten aanwezig zijn
+            # Groepeer per klant (email) en controleer of alle geselecteerde producten aanwezig zijn
+            customer_products = df_filtered.groupby('email')['product'].apply(set).reset_index()
+
+            # Vind klanten die alle geselecteerde producten hebben
+            qualified_customers = []
+            selected_products_set = set(selected_products)
+            for _, row in customer_products.iterrows():
+                if selected_products_set.issubset(row['product']):
+                    qualified_customers.append(row['email'])
+
+            # Filter op gekwalificeerde klanten
+            df_filtered = df_filtered[df_filtered['email'].isin(qualified_customers) &
+                                     df_filtered['product'].isin(selected_products)]
 
     # Aantal filter
     df_filtered['quantity_clean'] = df_filtered['quantity'].apply(lambda x: int(x) if pd.notna(x) and str(x).isdigit() else 1)
@@ -385,7 +481,7 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
 
     # Toon statistieken
     st.subheader("Statistieken")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         total_orders = len(df_filtered)
@@ -400,6 +496,10 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
         st.metric("Unieke Klanten", unique_customers)
 
     with col4:
+        total_quantity = df_filtered['quantity_clean'].sum()
+        st.metric("Totaal Producten", f"{total_quantity:,}".replace(',', '.'))
+
+    with col5:
         avg_order_value = total_amount / total_orders if total_orders > 0 else 0
         st.metric("Gem. Orderwaarde", f"€{avg_order_value:,.2f}".replace(',', '.'))
 
@@ -409,8 +509,8 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
     # Selecteer kolommen om te tonen
     display_columns = [
         'paid_at', 'product', 'quantity', 'amount_with_tax',
-        'company', 'firstname', 'lastname', 'city',
-        'payment_status', 'payment_method'
+        'company', 'firstname', 'lastname', 'full_name', 'email', 'city',
+        'payment_method'
     ]
 
     # Zorg dat kolommen bestaan
@@ -431,17 +531,14 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
             )
 
         # Formatteer namen
-        if 'firstname' in display_df.columns and 'lastname' in display_df.columns:
-            display_df['Naam'] = display_df.apply(
-                lambda row: f"{row.get('firstname', '')} {row.get('lastname', '')}".strip(),
-                axis=1
-            )
-            display_df = display_df.drop(['firstname', 'lastname'], axis=1)
-            # Verplaats Naam kolom naar juiste positie
-            cols = list(display_df.columns)
-            cols.insert(cols.index('city'), 'Naam')
-            cols.remove('Naam')
-            display_df = display_df[cols]
+        if 'full_name' in display_df.columns:
+            # Rename full_name to Naam for better readability
+            display_df = display_df.rename(columns={'full_name': 'Naam'})
+            # Remove individual name columns if they exist
+            if 'firstname' in display_df.columns:
+                display_df = display_df.drop(['firstname'], axis=1)
+            if 'lastname' in display_df.columns:
+                display_df = display_df.drop(['lastname'], axis=1)
 
         # Hernoem kolommen voor betere leesbaarheid
         column_names = {
@@ -450,10 +547,9 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
             'quantity': 'Aantal',
             'amount_with_tax': 'Bedrag (incl. BTW)',
             'company': 'Bedrijf',
+            'email': 'E-mail',
             'city': 'Plaats',
-            'payment_status': 'Betaalstatus',
-            'payment_method': 'Betaalmethode',
-            'Naam': 'Naam'
+            'payment_method': 'Betaalmethode'
         }
         display_df = display_df.rename(columns=column_names)
 
@@ -470,7 +566,7 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
 
         # Knoppen sectie
         st.subheader("Acties")
-        col_button1, col_button2 = st.columns(2)
+        col_button1, col_button2, col_button3 = st.columns(3)
 
         with col_button1:
             # Download knop voor CSV
@@ -484,6 +580,17 @@ def show_overview_and_buttons(df, selected_products, sort_order, start_date, end
             )
 
         with col_button2:
+            # Download knop voor Excel (verzendformaat)
+            excel_bytes = generate_excel_export(df_filtered)
+            st.download_button(
+                label="Download Excel (verzendformaat)",
+                data=excel_bytes,
+                file_name=f"verzendadressen_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width='stretch'
+            )
+
+        with col_button3:
             # Genereer verzendlabels knop
             if selected_products and st.button("Genereer Verzendlabels", type="primary", width='stretch'):
                 with st.spinner("Verzendlabels worden gegenereerd..."):
@@ -596,30 +703,36 @@ def main():
                     help="Maximum aantal producten per order (laat leeg voor geen limiet)"
                 )
 
-            # Haal datums uit paid_at kolom voor defaults
+            # Get initial date range and store in session state
             df_dates = pd.to_datetime(df['paid_at'], errors='coerce').dropna()
             if not df_dates.empty:
-                min_date = df_dates.min().date()
-                max_date = df_dates.max().date()
+                overall_min_date = df_dates.min().date()
+                overall_max_date = df_dates.max().date()
             else:
-                min_date = datetime.now().date() - timedelta(days=30)
-                max_date = datetime.now().date()
+                overall_min_date = datetime.now().date() - timedelta(days=30)
+                overall_max_date = datetime.now().date()
 
-            # Datumbereik filter (live updated)
+            # Initialize session state for dates if not exists
+            if 'start_date' not in st.session_state:
+                st.session_state.start_date = overall_min_date
+            if 'end_date' not in st.session_state:
+                st.session_state.end_date = overall_max_date
+
+            # Datumbereik filter
             st.subheader("Datumbereik (paid_at)")
             col_date1, col_date2 = st.columns(2)
 
             with col_date1:
                 start_date = st.date_input(
                     "Vanaf datum:",
-                    value=min_date,
+                    value=st.session_state.start_date,
                     help="Filter orders vanaf deze datum"
                 )
 
             with col_date2:
                 end_date = st.date_input(
                     "Tot en met datum:",
-                    value=max_date,
+                    value=st.session_state.end_date,
                     help="Filter orders tot en met deze datum"
                 )
 
@@ -670,6 +783,29 @@ def main():
                 else:
                     st.session_state.product_selections[product] = False
 
+            # Naam filter
+            st.subheader("Naam Filteren")
+            # Combineer naam velden voor filteren
+            df['full_name'] = df.apply(lambda row: f"{str(row.get('firstname', '')).strip()} {str(row.get('lastname', '')).strip()}".strip(), axis=1)
+            unique_names = df['full_name'].dropna().unique().tolist()
+            unique_names = [name for name in unique_names if name and name != 'nan']
+
+            selected_names = st.multiselect(
+                "Selecteer personen:",
+                unique_names[:100],  # Beperk tot eerste 100 voor performance
+                default=[],
+                help="Filter op specifieke personen (max 100 getoond)"
+            )
+
+            # Product logica filter
+            st.subheader("Product Logica")
+            product_logic = st.radio(
+                "Hoe wil je producten filteren?",
+                options=["OR", "AND"],
+                format_func=lambda x: "OF (minstens één van de geselecteerde producten)" if x == "OR" else "EN (alle geselecteerde producten moeten aanwezig zijn)",
+                help="OR: Klant heeft minstens één geselecteerd product | AND: Klant heeft alle geselecteerde producten"
+            )
+
             # Toon geselecteerde producten
             if selected_products:
                 st.success(f"{len(selected_products)} producten geselecteerd: {', '.join(selected_products[:3])}{'...' if len(selected_products) > 3 else ''}")
@@ -679,9 +815,33 @@ def main():
             if len(available_products) < len(all_products):
                 st.warning(f"{len(all_products) - len(available_products)} product(en) niet beschikbaar voor huidige hoeveelheidsfilter")
 
-            
+            # Update date range based on selected products (only as suggestion)
+            if selected_products:
+                # Filter data on selected products and quantity
+                temp_df = df.copy()
+                temp_df['quantity_clean'] = temp_df['quantity'].apply(lambda x: int(x) if pd.notna(x) and str(x).isdigit() else 1)
+                temp_df = temp_df[temp_df['quantity_clean'] >= min_quantity]
+                if max_quantity is not None:
+                    temp_df = temp_df[temp_df['quantity_clean'] <= max_quantity]
+
+                # Filter on selected products
+                temp_df = temp_df[temp_df['product'].isin(selected_products)]
+
+                # Get dates from filtered products
+                product_dates = pd.to_datetime(temp_df['paid_at'], errors='coerce').dropna()
+                if not product_dates.empty:
+                    suggested_start_date = product_dates.min().date()
+                    suggested_end_date = product_dates.max().date()
+
+                    # Only update if user hasn't manually changed dates
+                    # Check if current dates are the overall dates (not manually set)
+                    if (start_date == overall_min_date and end_date == overall_max_date):
+                        st.session_state.start_date = suggested_start_date
+                        st.session_state.end_date = suggested_end_date
+                        st.info(f"📅 Datumbereik aangepast voor geselecteerde producten: {suggested_start_date} t/m {suggested_end_date}")
+
             # Toon het overzicht en knoppen op dezelfde pagina
-            show_overview_and_buttons(df, selected_products, sort_order, start_date, end_date, min_quantity, max_quantity)
+            show_overview_and_buttons(df, selected_products, sort_order, start_date, end_date, min_quantity, max_quantity, selected_names, product_logic)
 
     
 if __name__ == "__main__":
